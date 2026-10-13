@@ -1,0 +1,65 @@
+# 复盘取数
+
+给后续交易日复盘用。先读本文件，再按清单一次取完。不要重复请求已经确认没有的数据，也不要在正文里写「暂缺」。
+
+产出文件：`复盘/YYYYMM/YYYYMMDD.md`。结构对齐最近一份已成稿复盘。三级标题，标题和正文之间不空行。文末注明数据源、复权口径和「非投资建议」。
+
+凭据用已有的用户级 `HITHINK_FINANCE_API_KEY` 或 `%APPDATA%\hithink-finance\credentials.env`。Key 不进入仓库、日志和正文。请求走 REST，Header 为 `X-api-key`。大结果写到本机临时目录，对话里只留汇总。
+
+对比日是上一个交易日，用交易日历确认，不把休市日当成「昨日」。日历接口只覆盖到当天，不把窗口之外的日期写成已确认交易日。
+
+## 不要再请求
+
+这些在公开接口里没有，或实测对不上，复盘里直接不写：
+
+- 行业资金净流入、净流出
+- 中证2000行情
+- 跌停池盘中打开、跌停收盘封板率
+- 把「N天M板」当成可稳定获取的字段。涨停池的 `continue_day_text` 文档示例含「5天4板」，但 2026-09-11 已知的 5天3板、4天3板实际返回成了「N连板」或「首板」。连板天梯只有 `board_num`，没有该文本
+
+## 一次取完
+
+同一天复盘只打这一组请求。指数用一个 `start`/`end` 窗口覆盖对比日和当日，不要按指数、按天拆开重拉。
+
+1. `GET /api/a-share/calendar/trading-days`  
+   无参数。确认当日、对比日，以及中间是否休市。
+2. `GET /api/a-share-index/prices/historical`  
+   每个代码一次，`interval=1d`。代码固定为：上证 `000001.SH`、深证 `399001.SZ`、创业板 `399006.SZ`、科创50 `000688.SH`、沪深300 `000300.SH`、上证50 `000016.SH`、中证500 `000905.SH`、中证1000 `000852.SH`、昨日涨停表现 `883900.TI`。
+3. 当日三个池，`date_ms` 为上海时区当日 00:00:00 的毫秒时间戳，`size=200`，翻页到 `pagination.total`：  
+   `GET /api/a-share/special-data/limit-up-pool`  
+   `GET /api/a-share/special-data/limit-down-pool`  
+   `GET /api/a-share/special-data/limit-break-pool`  
+   涨停池排序可用 `sort_field=last_price`。
+4. 只给涨停池里的代码拉日 K：`GET /api/a-share/prices/historical`，`interval=1d`，`adjust=none`。窗口含对比日和当日，用来判断一字、T 字、换手，并取成交额。
+5. `GET /api/dump/market-dumps/daily-k-10d/download-url`  
+   立刻下载 Parquet。同一交易日已经下过且文件里有当日 `date_ms` 时，不要重新签名下载。
+6. 连板股换手率才请求集合竞价：`GET /api/a-share/auction/snapshot`，`stage=final`，只传连续连板的 `thscodes`。这是当天快照，没有历史日期参数；过了当日再补换手率会拿不到当天流通市值。
+7. 热度榜用当天榜：`GET /api/a-share/special-data/hot-stock-list?period=day`。一天一次，在收盘后、下一交易日开盘前取。字段用 `rank`、`name`、`thscode`、`heat`、`rank_change`、`rank_trend`。不要用 `hot-stock-list-history` 写正文，那个接口没有热度、排名变化和趋势。
+
+跟踪个股的跨日涨跌优先用第 5 步的 Parquet，按 `thscode` 对齐收盘价。不要为每只跟踪股再打历史 K 线。
+
+## 指标怎么算
+
+| 指标 | 来源 |
+| --- | --- |
+| 指数收盘、涨跌幅 | 指数日 K 收盘相对前一根收盘 |
+| 成交额、较昨日 | 指数日 K 的 `turnover`。较昨日 = 当日 / 前一交易日 - 1 |
+| 两市成交额 | 上证与深证 `turnover` 相加 |
+| 成交量（亿手） | 上证与深证 `volume`（股）相加后除以 `1e10` |
+| 上涨、平盘、下跌家数 | Parquet 里未复权收盘对比前一交易日收盘。代码用 `^[036][0-9]{5}\.(SH\|SZ)$`，不含北交所 |
+| 涨停、跌停、炸板家数 | 三个池的 `pagination.total`，与拉全的条数核对 |
+| 封板率 | 涨停家数 /（涨停 + 炸板） |
+| 连板高度、连板文本 | 涨停池 `continue_day_text`、`continue_day_cnt`。正文连板以这个字段为准 |
+| 一字 / T 字 / 换手 | 当日日 K，`adjust=none`。开高低收几乎相等为一字；开=高=收且最低价更低为 T 字；其余涨停为换手 |
+| 封单、成交额、涨停原因 | 涨停池 `seal_money`、日 K `turnover`、`limit_up_reason` |
+| 连板换手率 | 当日成交量 / 流通股本。流通股本 = 集合竞价 `float_market_cap` / 当日最新价 |
+| 昨日涨停表现 | `883900.TI` 当日收盘相对前一交易日收盘的涨跌幅 |
+| 热点方向 | 用 `limit_up_reason` 归类，不用资金流 |
+| 热度榜 | 当天榜 `hot-stock-list?period=day` 的 `rank`、`heat`、`rank_change`、`rank_trend`。`rank_change` 正数为上升。`up/down/flat` 写成上升/下降/持平。收盘后立刻取，不要留到下一交易日 |
+| 预判验证 | 只对照上一份复盘里已经写下的预期，不补写当时没有的预期 |
+
+炸板池自带 `turnover`、`turnover_ratio_pct`、`open_times`，炸板个股不要再为了换手率去打集合竞价。
+
+## 正文里保留的计算口径
+
+数据说明写三件事即可：对比日和复权 `none`、宽度的股票范围、连板换手率用了流通市值。不要再解释已删除的指标。
